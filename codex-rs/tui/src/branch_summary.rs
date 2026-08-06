@@ -1,14 +1,14 @@
-//! Branch and pull-request metadata for TUI status-line items.
+//! Branch and hosted review-request metadata for TUI status-line items.
 //!
-//! This module owns the git and GitHub probes behind the TUI `git-branch`, `pull-request-number`,
-//! and `branch-changes` status-line items. It deliberately talks only to a
+//! This module owns the git, GitHub, and GitLab probes behind the TUI `git-branch`,
+//! `pull-request-number`, and `branch-changes` status-line items. It deliberately talks only to a
 //! `WorkspaceCommandExecutor`, not to `tokio::process::Command`, so the same lookup logic works
 //! when the TUI is connected to either an embedded or remote app-server.
 //!
-//! All lookups are best-effort. A failed command, missing `git` or `gh`, unauthenticated GitHub
-//! CLI, non-git directory, or ambiguous repository state should result in absent optional metadata
-//! rather than a user-visible error. The status line can then render whichever pieces are available
-//! without blocking the rest of the UI.
+//! All lookups are best-effort. A failed command, missing `git`, `gh`, or `glab`, unauthenticated
+//! provider CLI, non-git directory, or ambiguous repository state should result in absent optional
+//! metadata rather than a user-visible error. The status line can then render whichever pieces are
+//! available without blocking the rest of the UI.
 
 #[cfg(test)]
 use std::collections::VecDeque;
@@ -37,23 +37,61 @@ pub(crate) struct GitBranchDiffStats {
 /// missing fields as omitted optional UI rather than as a hard lookup failure.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StatusLineGitSummary {
-    /// Open pull request associated with the current branch or HEAD commit.
-    pub(crate) pull_request: Option<StatusLinePullRequest>,
+    /// Open hosted review request associated with the current branch or HEAD commit.
+    pub(crate) review_request: Option<StatusLineReviewRequest>,
     /// Additions and deletions between `HEAD` and the repository default branch merge base.
     pub(crate) branch_change_stats: Option<GitBranchDiffStats>,
 }
 
-/// Open GitHub pull request shown by the `pull-request-number` status-line item.
+/// The provider-specific terminology used by a hosted review request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StatusLineReviewRequestKind {
+    /// GitHub's pull-request terminology.
+    GitHubPullRequest,
+    /// GitLab's merge-request terminology.
+    GitLabMergeRequest,
+}
+
+impl StatusLineReviewRequestKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::GitHubPullRequest => "PR",
+            Self::GitLabMergeRequest => "MR",
+        }
+    }
+
+    fn number_prefix(self) -> char {
+        match self {
+            Self::GitHubPullRequest => '#',
+            Self::GitLabMergeRequest => '!',
+        }
+    }
+}
+
+/// Open hosted review request shown by the `pull-request-number` status-line item.
 ///
-/// The URL is kept with the number so clickable renderers can open the same PR represented by the
-/// compact label. Callers should only construct this for open PRs; closed or merged PRs are filtered
-/// out by this module.
+/// The URL is kept with the number so clickable renderers can open the same request represented by
+/// the compact label. Callers should only construct this for open requests; closed or merged
+/// requests are filtered out by this module.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StatusLinePullRequest {
-    /// GitHub pull request number.
+pub(crate) struct StatusLineReviewRequest {
+    /// Provider-specific review-request terminology.
+    pub(crate) kind: StatusLineReviewRequestKind,
+    /// Pull-request or merge-request number.
     pub(crate) number: u64,
-    /// Browser URL for the pull request.
+    /// Browser URL for the review request.
     pub(crate) url: String,
+}
+
+impl StatusLineReviewRequest {
+    pub(crate) fn display(&self) -> String {
+        format!(
+            "{} {}{}",
+            self.kind.label(),
+            self.kind.number_prefix(),
+            self.number
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,6 +114,14 @@ struct GhPullRequestView {
 struct GhPullRequestApiItem {
     number: u64,
     #[serde(rename = "html_url")]
+    url: String,
+    state: String,
+}
+
+#[derive(Deserialize)]
+struct GlabMergeRequestView {
+    iid: u64,
+    #[serde(rename = "web_url")]
     url: String,
     state: String,
 }
@@ -111,21 +157,21 @@ pub(crate) async fn current_branch_name(
     Some(output.stdout.trim().to_string()).filter(|name| !name.is_empty())
 }
 
-/// Resolves PR and branch-change metadata for one status-line working directory.
+/// Resolves hosted review-request and branch-change metadata for one status-line working directory.
 ///
-/// The PR and diff-stat probes run concurrently because each is independent and both are optional.
-/// The returned summary is suitable for caching by `cwd`; callers should discard it if the active
-/// status-line cwd changes before the async lookup completes.
+/// The review-request and diff-stat probes run concurrently because each is independent and both
+/// are optional. The returned summary is suitable for caching by `cwd`; callers should discard it
+/// if the active status-line cwd changes before the async lookup completes.
 pub(crate) async fn status_line_git_summary(
     runner: &dyn WorkspaceCommandExecutor,
     cwd: &Path,
 ) -> StatusLineGitSummary {
-    let (pull_request, branch_change_stats) = tokio::join!(
-        open_pull_request(runner, cwd),
+    let (review_request, branch_change_stats) = tokio::join!(
+        open_review_request(runner, cwd),
         branch_diff_stats_to_default_branch(runner, cwd),
     );
     StatusLineGitSummary {
-        pull_request,
+        review_request,
         branch_change_stats,
     }
 }
@@ -331,27 +377,31 @@ async fn git_ref_exists(
     .is_ok_and(|output| output.success())
 }
 
-/// Resolves the open PR associated with the current checkout.
+/// Resolves the open hosted review request associated with the current checkout.
 ///
-/// Branch-based lookup is attempted first because it is cheap and mirrors `gh pr view`. Commit-based
-/// lookup is used as a fallback so fork workflows can still find a PR opened against the upstream
-/// repository even when `gh` infers the fork from the current checkout.
-async fn open_pull_request(
+/// GitHub branch lookup is attempted first, followed by GitLab's current-branch lookup. The GitHub
+/// commit-based fallback preserves fork workflows where `gh` can find an upstream PR by commit even
+/// when the branch lookup cannot infer the repository.
+async fn open_review_request(
     runner: &dyn WorkspaceCommandExecutor,
     cwd: &Path,
-) -> Option<StatusLinePullRequest> {
-    if let Some(pull_request) = open_pull_request_for_current_branch(runner, cwd).await {
+) -> Option<StatusLineReviewRequest> {
+    if let Some(pull_request) = open_github_pull_request_for_current_branch(runner, cwd).await {
         return Some(pull_request);
     }
 
-    open_pull_request_for_head_commit(runner, cwd).await
+    if let Some(merge_request) = open_gitlab_merge_request_for_current_branch(runner, cwd).await {
+        return Some(merge_request);
+    }
+
+    open_github_pull_request_for_head_commit(runner, cwd).await
 }
 
 /// Uses GitHub CLI's current-branch PR lookup.
-async fn open_pull_request_for_current_branch(
+async fn open_github_pull_request_for_current_branch(
     runner: &dyn WorkspaceCommandExecutor,
     cwd: &Path,
-) -> Option<StatusLinePullRequest> {
+) -> Option<StatusLineReviewRequest> {
     let output = run_gh_command(runner, cwd, &["pr", "view", "--json", "number,url,state"])
         .await
         .ok()?;
@@ -361,11 +411,30 @@ async fn open_pull_request_for_current_branch(
     pull_request_from_view_output(&output.stdout)
 }
 
-/// Looks up open PRs for `HEAD` across the upstream/fork repository search order.
-async fn open_pull_request_for_head_commit(
+/// Uses GitLab CLI's current-branch MR lookup.
+///
+/// `glab` resolves the repository and GitLab host from the git remote and its configured auth, so
+/// this also works for self-hosted GitLab instances without hard-coding a hostname in Codex.
+async fn open_gitlab_merge_request_for_current_branch(
     runner: &dyn WorkspaceCommandExecutor,
     cwd: &Path,
-) -> Option<StatusLinePullRequest> {
+) -> Option<StatusLineReviewRequest> {
+    let branch = current_branch_name(runner, cwd).await?;
+    let output = run_glab_command(runner, cwd, &["mr", "view", &branch, "--output", "json"])
+        .await
+        .ok()?;
+    if !output.success() {
+        return None;
+    }
+
+    merge_request_from_view_output(&output.stdout)
+}
+
+/// Looks up open PRs for `HEAD` across the upstream/fork repository search order.
+async fn open_github_pull_request_for_head_commit(
+    runner: &dyn WorkspaceCommandExecutor,
+    cwd: &Path,
+) -> Option<StatusLineReviewRequest> {
     let head_sha = current_head_sha(runner, cwd).await?;
     for repo in gh_repo_search_order(runner, cwd).await? {
         let endpoint = format!("repos/{repo}/commits/{head_sha}/pulls");
@@ -422,28 +491,42 @@ async fn gh_repo_search_order(
     repo_search_order_from_output(&output.stdout)
 }
 
-/// Parses `gh pr view --json number,url,state` output for an open PR.
-fn pull_request_from_view_output(stdout: &str) -> Option<StatusLinePullRequest> {
+/// Parses `gh pr view --json number,url,state` output for an open GitHub PR.
+fn pull_request_from_view_output(stdout: &str) -> Option<StatusLineReviewRequest> {
     let pull_request = serde_json::from_str::<GhPullRequestView>(stdout).ok()?;
     pull_request
         .state
         .eq_ignore_ascii_case("open")
-        .then_some(StatusLinePullRequest {
+        .then_some(StatusLineReviewRequest {
+            kind: StatusLineReviewRequestKind::GitHubPullRequest,
             number: pull_request.number,
             url: pull_request.url,
         })
 }
 
-/// Parses the GitHub REST commit-to-PR response and returns the first open PR.
-fn pull_request_from_api_output(stdout: &str) -> Option<StatusLinePullRequest> {
+/// Parses the GitHub REST commit-to-PR response and returns the first open GitHub PR.
+fn pull_request_from_api_output(stdout: &str) -> Option<StatusLineReviewRequest> {
     serde_json::from_str::<Vec<GhPullRequestApiItem>>(stdout)
         .ok()?
         .into_iter()
         .find(|pull_request| pull_request.state.eq_ignore_ascii_case("open"))
-        .map(|pull_request| StatusLinePullRequest {
+        .map(|pull_request| StatusLineReviewRequest {
+            kind: StatusLineReviewRequestKind::GitHubPullRequest,
             number: pull_request.number,
             url: pull_request.url,
         })
+}
+
+/// Parses `glab mr view --output json` output for an open GitLab MR.
+fn merge_request_from_view_output(stdout: &str) -> Option<StatusLineReviewRequest> {
+    let merge_request = serde_json::from_str::<GlabMergeRequestView>(stdout).ok()?;
+    (merge_request.state.eq_ignore_ascii_case("opened")
+        || merge_request.state.eq_ignore_ascii_case("open"))
+    .then_some(StatusLineReviewRequest {
+        kind: StatusLineReviewRequestKind::GitLabMergeRequest,
+        number: merge_request.iid,
+        url: merge_request.url,
+    })
 }
 
 /// Parses `gh repo view` output into the repository search order for fallback PR lookup.
@@ -510,6 +593,28 @@ async fn run_gh_command(
         .await
 }
 
+/// Runs a GitLab CLI command through the workspace-command abstraction.
+///
+/// Prompting is disabled because status-line probes are background UI work. The configured
+/// `glab` auth context is used for GitLab.com and self-hosted GitLab hosts.
+async fn run_glab_command(
+    runner: &dyn WorkspaceCommandExecutor,
+    cwd: &Path,
+    args: &[&str],
+) -> Result<WorkspaceCommandOutput, crate::workspace_command::WorkspaceCommandError> {
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push("glab".to_string());
+    argv.extend(args.iter().map(|arg| (*arg).to_string()));
+    runner
+        .run(
+            WorkspaceCommand::new(argv)
+                .cwd(cwd.to_path_buf())
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GLAB_PAGER", "cat"),
+        )
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,20 +676,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_pull_request_uses_current_branch_view_first() {
+    async fn open_review_request_uses_github_branch_view_first() {
         let runner = FakeRunner::new(vec![response(
             &["gh", "pr", "view", "--json", "number,url,state"],
             /*exit_code*/ 0,
             r#"{"number":20252,"url":"https://github.com/openai/codex/pull/20252","state":"OPEN"}"#,
         )]);
 
-        let pull_request = open_pull_request(&runner, Path::new("/repo"))
+        let pull_request = open_review_request(&runner, Path::new("/repo"))
             .await
             .expect("pull request");
 
         assert_eq!(
             pull_request,
-            StatusLinePullRequest {
+            StatusLineReviewRequest {
+                kind: StatusLineReviewRequestKind::GitHubPullRequest,
                 number: 20_252,
                 url: "https://github.com/openai/codex/pull/20252".to_string(),
             }
@@ -593,10 +699,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_pull_request_falls_back_to_parent_repo_commit_lookup() {
+    async fn open_review_request_falls_back_to_github_parent_repo_commit_lookup() {
         let runner = FakeRunner::new(vec![
             response(
                 &["gh", "pr", "view", "--json", "number,url,state"],
+                /*exit_code*/ 1,
+                "",
+            ),
+            response(
+                &["git", "branch", "--show-current"],
+                /*exit_code*/ 0,
+                "feature/status-line\n",
+            ),
+            response(
+                &[
+                    "glab",
+                    "mr",
+                    "view",
+                    "feature/status-line",
+                    "--output",
+                    "json",
+                ],
                 /*exit_code*/ 1,
                 "",
             ),
@@ -623,13 +746,14 @@ mod tests {
             ),
         ]);
 
-        let pull_request = open_pull_request(&runner, Path::new("/repo"))
+        let pull_request = open_review_request(&runner, Path::new("/repo"))
             .await
             .expect("pull request");
 
         assert_eq!(
             pull_request,
-            StatusLinePullRequest {
+            StatusLineReviewRequest {
+                kind: StatusLineReviewRequestKind::GitHubPullRequest,
                 number: 20_252,
                 url: "https://github.com/openai/codex/pull/20252".to_string(),
             }
@@ -643,13 +767,55 @@ mod tests {
         ]));
     }
 
+    #[tokio::test]
+    async fn open_review_request_uses_gitlab_current_branch_view() {
+        let runner = FakeRunner::new(vec![
+            response(
+                &["gh", "pr", "view", "--json", "number,url,state"],
+                /*exit_code*/ 1,
+                "",
+            ),
+            response(
+                &["git", "branch", "--show-current"],
+                /*exit_code*/ 0,
+                "feature/status-line\n",
+            ),
+            response(
+                &[
+                    "glab",
+                    "mr",
+                    "view",
+                    "feature/status-line",
+                    "--output",
+                    "json",
+                ],
+                /*exit_code*/ 0,
+                r#"{"iid":123,"web_url":"https://gitlab.example.com/group/project/-/merge_requests/123","state":"opened"}"#,
+            ),
+        ]);
+
+        let merge_request = open_review_request(&runner, Path::new("/repo"))
+            .await
+            .expect("merge request");
+
+        assert_eq!(
+            merge_request,
+            StatusLineReviewRequest {
+                kind: StatusLineReviewRequestKind::GitLabMergeRequest,
+                number: 123,
+                url: "https://gitlab.example.com/group/project/-/merge_requests/123".to_string(),
+            }
+        );
+    }
+
     #[test]
     fn status_line_pr_view_parser_requires_open_pr() {
         assert_eq!(
             pull_request_from_view_output(
                 r#"{"number":20252,"url":"https://github.com/openai/codex/pull/20252","state":"OPEN"}"#
             ),
-            Some(StatusLinePullRequest {
+            Some(StatusLineReviewRequest {
+                kind: StatusLineReviewRequestKind::GitHubPullRequest,
                 number: 20_252,
                 url: "https://github.com/openai/codex/pull/20252".to_string(),
             })
@@ -660,6 +826,49 @@ mod tests {
                 r#"{"number":20252,"url":"https://github.com/openai/codex/pull/20252","state":"MERGED"}"#
             ),
             None
+        );
+    }
+
+    #[test]
+    fn status_line_mr_view_parser_requires_open_mr() {
+        assert_eq!(
+            merge_request_from_view_output(
+                r#"{"iid":123,"web_url":"https://gitlab.example.com/group/project/-/merge_requests/123","state":"opened"}"#
+            ),
+            Some(StatusLineReviewRequest {
+                kind: StatusLineReviewRequestKind::GitLabMergeRequest,
+                number: 123,
+                url: "https://gitlab.example.com/group/project/-/merge_requests/123".to_string(),
+            })
+        );
+
+        assert_eq!(
+            merge_request_from_view_output(
+                r#"{"iid":123,"web_url":"https://gitlab.example.com/group/project/-/merge_requests/123","state":"merged"}"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn status_line_review_request_display_uses_provider_terminology() {
+        assert_eq!(
+            StatusLineReviewRequest {
+                kind: StatusLineReviewRequestKind::GitHubPullRequest,
+                number: 20_252,
+                url: "https://github.com/openai/codex/pull/20252".to_string(),
+            }
+            .display(),
+            "PR #20252"
+        );
+        assert_eq!(
+            StatusLineReviewRequest {
+                kind: StatusLineReviewRequestKind::GitLabMergeRequest,
+                number: 123,
+                url: "https://gitlab.example.com/group/project/-/merge_requests/123".to_string(),
+            }
+            .display(),
+            "MR !123"
         );
     }
 

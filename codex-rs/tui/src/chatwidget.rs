@@ -461,6 +461,7 @@ use self::user_messages::user_message_preview_text;
 mod warnings;
 use self::warnings::WarningDisplayState;
 pub(crate) use crate::branch_summary::StatusLineGitSummary;
+pub(crate) use crate::branch_summary::StatusLineReviewRequest;
 use crate::streaming::chunking::AdaptiveChunkingPolicy;
 use crate::streaming::commit_tick::CommitTickScope;
 use crate::streaming::commit_tick::run_commit_tick;
@@ -746,7 +747,7 @@ pub(crate) struct ChatWidget {
     status_line_branch_pending: bool,
     // True once we've attempted a branch lookup for the current CWD.
     status_line_branch_lookup_complete: bool,
-    // Cached PR and branch-change summary for the active status-line cwd.
+    // Cached hosted review-request and branch-change summary for the active status-line cwd.
     status_line_git_summary: Option<StatusLineGitSummary>,
     // CWD used to resolve the cached Git summary; change resets summary state.
     status_line_git_summary_cwd: Option<PathBuf>,
