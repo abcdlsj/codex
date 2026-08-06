@@ -77,7 +77,7 @@ pub(crate) enum StatusLineItem {
     /// Current git branch name (if in a repository).
     GitBranch,
 
-    /// Open pull request number for the current branch.
+    /// Open pull/merge request number for the current branch.
     PullRequestNumber,
 
     /// Committed branch diff stats relative to the default branch.
@@ -155,7 +155,7 @@ impl StatusLineItem {
             StatusLineItem::ProjectRoot => "Project name (omitted when unavailable)",
             StatusLineItem::GitBranch => "Current Git branch (omitted when unavailable)",
             StatusLineItem::PullRequestNumber => {
-                "Open pull request number for the current branch (omitted when unavailable)"
+                "Open pull/merge request number for the current branch (omitted when unavailable)"
             }
             StatusLineItem::BranchChanges => {
                 "Committed branch changes against the default branch (omitted when unavailable)"

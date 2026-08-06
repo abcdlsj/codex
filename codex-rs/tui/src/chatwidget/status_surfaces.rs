@@ -197,7 +197,7 @@ impl ChatWidget {
         let hyperlink_url = selections
             .status_line_items
             .contains(&StatusLineItem::PullRequestNumber)
-            .then(|| self.status_line_pull_request_url())
+            .then(|| self.status_line_review_request_url())
             .flatten();
         self.set_status_line_hyperlink(hyperlink_url);
     }
@@ -664,8 +664,8 @@ impl ChatWidget {
             StatusLineItem::PullRequestNumber => self
                 .status_line_git_summary
                 .as_ref()
-                .and_then(|summary| summary.pull_request.as_ref())
-                .map(|pull_request| format!("PR #{}", pull_request.number)),
+                .and_then(|summary| summary.review_request.as_ref())
+                .map(StatusLineReviewRequest::display),
             StatusLineItem::BranchChanges => self
                 .status_line_git_summary
                 .as_ref()
@@ -752,11 +752,11 @@ impl ChatWidget {
         }
     }
 
-    fn status_line_pull_request_url(&self) -> Option<String> {
+    fn status_line_review_request_url(&self) -> Option<String> {
         self.status_line_git_summary
             .as_ref()
-            .and_then(|summary| summary.pull_request.as_ref())
-            .map(|pull_request| pull_request.url.clone())
+            .and_then(|summary| summary.review_request.as_ref())
+            .map(|review_request| review_request.url.clone())
     }
 
     pub(super) fn status_surface_preview_value_for_item(

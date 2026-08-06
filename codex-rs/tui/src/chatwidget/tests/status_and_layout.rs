@@ -200,10 +200,11 @@ async fn token_usage_update_uses_runtime_context_window() {
 }
 
 #[tokio::test]
-async fn status_line_git_summary_items_render_values() {
+async fn status_line_review_request_items_render_values() {
     let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.status_line_git_summary = Some(StatusLineGitSummary {
-        pull_request: Some(crate::branch_summary::StatusLinePullRequest {
+        review_request: Some(crate::branch_summary::StatusLineReviewRequest {
+            kind: crate::branch_summary::StatusLineReviewRequestKind::GitHubPullRequest,
             number: 20_252,
             url: "https://github.com/openai/codex/pull/20252".to_string(),
         }),
@@ -220,6 +221,20 @@ async fn status_line_git_summary_items_render_values() {
     assert_eq!(
         chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::BranchChanges),
         Some("+143 -22".to_string())
+    );
+
+    chat.status_line_git_summary = Some(StatusLineGitSummary {
+        review_request: Some(crate::branch_summary::StatusLineReviewRequest {
+            kind: crate::branch_summary::StatusLineReviewRequestKind::GitLabMergeRequest,
+            number: 123,
+            url: "https://gitlab.example.com/group/project/-/merge_requests/123".to_string(),
+        }),
+        branch_change_stats: None,
+    });
+
+    assert_eq!(
+        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::PullRequestNumber),
+        Some("MR !123".to_string())
     );
 }
 
@@ -244,7 +259,7 @@ async fn raw_output_status_line_value_only_shows_when_enabled() {
 async fn status_line_branch_changes_render_no_changes() {
     let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.status_line_git_summary = Some(StatusLineGitSummary {
-        pull_request: None,
+        review_request: None,
         branch_change_stats: Some(crate::branch_summary::GitBranchDiffStats {
             additions: 0,
             deletions: 0,
@@ -266,7 +281,8 @@ async fn stale_status_line_git_summary_update_is_ignored() {
     chat.set_status_line_git_summary(
         PathBuf::from("/other"),
         StatusLineGitSummary {
-            pull_request: Some(crate::branch_summary::StatusLinePullRequest {
+            review_request: Some(crate::branch_summary::StatusLineReviewRequest {
+                kind: crate::branch_summary::StatusLineReviewRequestKind::GitHubPullRequest,
                 number: 20_252,
                 url: "https://github.com/openai/codex/pull/20252".to_string(),
             }),
